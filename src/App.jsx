@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
+import * as XLSX from "xlsx";
 
 const STORAGE_KEY = "km_tracker_data";
 
@@ -52,7 +53,6 @@ export default function KmTracker() {
   const [tab, setTab] = useState("log");
   const [toast, setToast] = useState(null);
 
-  // Forms
   const [tripForm, setTripForm] = useState({
     date: new Date().toISOString().split("T")[0],
     openKm: "",
@@ -63,11 +63,9 @@ export default function KmTracker() {
   const [recipientInput, setRecipientInput] = useState("");
   const [vehicleInput, setVehicleInput] = useState("");
 
-  // Report filters
   const [reportType, setReportType] = useState("monthly");
   const [reportMonth, setReportMonth] = useState(getMonthYear(new Date().toISOString()));
   const [reportWeek, setReportWeek] = useState(getWeek(new Date().toISOString()));
-  const [emailSending, setEmailSending] = useState(false);
 
   useEffect(() => { saveData(data); }, [data]);
 
@@ -136,50 +134,227 @@ export default function KmTracker() {
 
   const reportStats = useMemo(() => {
     const totalKm = filteredTrips.reduce((s, t) => s + t.km, 0);
-    // Group by month to apply correct rates
     const byMonth = {};
     filteredTrips.forEach(t => {
       const m = getMonthYear(t.date);
       if (!byMonth[m]) byMonth[m] = { km: 0, rate: getRateForMonth(m) };
       byMonth[m].km += t.km;
     });
-    const totalReimb = Object.values(byMonth).reduce((s, m) => {
-      return s + (m.rate ? m.km * m.rate : 0);
-    }, 0);
+    const totalReimb = Object.values(byMonth).reduce((s, m) => s + (m.rate ? m.km * m.rate : 0), 0);
     const missingRates = Object.entries(byMonth).filter(([, v]) => !v.rate).map(([m]) => monthLabel(m));
     return { totalKm, totalReimb, byMonth, missingRates };
   }, [filteredTrips, data.rates]);
 
-  function buildReportText() {
-    const title = reportType === "monthly" ? monthLabel(reportMonth) : reportType === "weekly" ? `Week ${reportWeek}` : "All Trips";
-    let text = `KM REIMBURSEMENT REPORT — ${title}\nVehicle: ${data.vehicle}\n\n`;
-    text += `${"DATE".padEnd(12)}${"OPEN KM".padEnd(12)}${"CLOSE KM".padEnd(12)}${"KM".padEnd(8)}DESCRIPTION\n`;
-    text += "─".repeat(70) + "\n";
-    filteredTrips.forEach(t => {
-      text += `${t.date.padEnd(12)}${String(t.openKm).padEnd(12)}${String(t.closeKm).padEnd(12)}${String(t.km).padEnd(8)}${t.description}\n`;
-    });
-    text += "\n── SUMMARY ──\n";
-    text += `Total Trips: ${filteredTrips.length}\nTotal KM: ${formatKm(reportStats.totalKm)}\n\n`;
-    Object.entries(reportStats.byMonth).forEach(([m, v]) => {
-      text += `${monthLabel(m)}: ${formatKm(v.km)} @ ${v.rate ? `R${v.rate}/km` : "NO RATE SET"} = ${v.rate ? formatZAR(v.km * v.rate) : "—"}\n`;
-    });
-    text += `\nTOTAL REIMBURSEMENT: ${formatZAR(reportStats.totalReimb)}\n`;
-    if (reportStats.missingRates.length) text += `\n⚠ Missing rates for: ${reportStats.missingRates.join(", ")}\n`;
-    return text;
+  function getReportTitle() {
+    if (reportType === "monthly") return monthLabel(reportMonth);
+    if (reportType === "weekly") return `Week ${reportWeek}`;
+    return "All Trips";
   }
 
-  async function sendReport() {
+  // ── EXCEL EXPORT ──
+  function downloadExcel() {
+    if (!filteredTrips.length) return showToast("No trips to export", "error");
+
+    const wb = XLSX.utils.book_new();
+
+    // ── TRIPS SHEET ──
+    const tripsData = [
+      ["KM REIMBURSEMENT REPORT — " + getReportTitle()],
+      ["Vehicle:", data.vehicle],
+      ["Generated:", new Date().toLocaleDateString("en-ZA")],
+      [],
+      ["Date", "Opening KM", "Closing KM", "Distance (km)", "Description"],
+      ...filteredTrips.map(t => [t.date, t.openKm, t.closeKm, t.km, t.description]),
+      [],
+      ["SUMMARY"],
+      ["Total Trips", filteredTrips.length],
+      ["Total KM", reportStats.totalKm],
+    ];
+
+    Object.entries(reportStats.byMonth).forEach(([m, v]) => {
+      tripsData.push([monthLabel(m) + " Rate", v.rate ? `R${v.rate}/km` : "NOT SET"]);
+      tripsData.push([monthLabel(m) + " KM", v.km]);
+      tripsData.push([monthLabel(m) + " Reimbursement", v.rate ? v.km * v.rate : 0]);
+    });
+
+    tripsData.push(["TOTAL REIMBURSEMENT", reportStats.totalReimb]);
+
+    const ws = XLSX.utils.aoa_to_sheet(tripsData);
+
+    // Column widths
+    ws["!cols"] = [
+      { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 16 }, { wch: 40 }
+    ];
+
+    // Styling
+    const headerStyle = { font: { bold: true, sz: 14 }, fill: { fgColor: { rgb: "0D0D0D" } } };
+    const colHeaderStyle = { font: { bold: true, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: "1a1a1a" } }, alignment: { horizontal: "center" } };
+    const totalStyle = { font: { bold: true, sz: 12 }, fill: { fgColor: { rgb: "C8F04A" } } };
+    const currencyFmt = '"R "#,##0.00';
+    const kmFmt = '#,##0" km"';
+
+    // Apply title style
+    if (ws["A1"]) ws["A1"].s = headerStyle;
+
+    // Apply column headers style (row 5 = index 4)
+    ["A5","B5","C5","D5","E5"].forEach(cell => {
+      if (ws[cell]) ws[cell].s = colHeaderStyle;
+    });
+
+    // Format km and currency columns in data rows
+    const dataStart = 6;
+    filteredTrips.forEach((_, i) => {
+      const row = dataStart + i;
+      if (ws[`B${row}`]) ws[`B${row}`].z = '#,##0';
+      if (ws[`C${row}`]) ws[`C${row}`].z = '#,##0';
+      if (ws[`D${row}`]) ws[`D${row}`].z = '#,##0';
+    });
+
+    // Total reimbursement row styling
+    const totalRow = tripsData.length;
+    const totalCell = `A${totalRow}`;
+    const totalValCell = `B${totalRow}`;
+    if (ws[totalCell]) ws[totalCell].s = totalStyle;
+    if (ws[totalValCell]) {
+      ws[totalValCell].z = currencyFmt;
+      ws[totalValCell].s = totalStyle;
+    }
+
+    XLSX.utils.book_append_sheet(wb, ws, "Trip Report");
+
+    // ── RATES SHEET ──
+    const ratesData = [
+      ["Month", "Rate (R/km)"],
+      ...data.rates.map(r => [monthLabel(r.month), r.rate])
+    ];
+    const ws2 = XLSX.utils.aoa_to_sheet(ratesData);
+    ws2["!cols"] = [{ wch: 20 }, { wch: 14 }];
+    XLSX.utils.book_append_sheet(wb, ws2, "Monthly Rates");
+
+    const filename = `KM-Report-${getReportTitle().replace(/\s/g, "-")}.xlsx`;
+    XLSX.writeFile(wb, filename);
+    showToast("Excel downloaded ✓");
+  }
+
+  // ── PDF EXPORT ──
+  function downloadPDF() {
+    if (!filteredTrips.length) return showToast("No trips to export", "error");
+
+    const title = getReportTitle();
+    const rows = filteredTrips.map(t => `
+      <tr>
+        <td>${t.date}</td>
+        <td style="text-align:right">${t.openKm.toLocaleString()}</td>
+        <td style="text-align:right">${t.closeKm.toLocaleString()}</td>
+        <td style="text-align:right">${t.km.toLocaleString()}</td>
+        <td>${t.description}</td>
+      </tr>`).join("");
+
+    const breakdown = Object.entries(reportStats.byMonth).map(([m, v]) => `
+      <tr>
+        <td>${monthLabel(m)}</td>
+        <td style="text-align:right">${v.km.toLocaleString()} km</td>
+        <td style="text-align:right">${v.rate ? `R${v.rate}/km` : "⚠ No rate"}</td>
+        <td style="text-align:right">${v.rate ? formatZAR(v.km * v.rate) : "—"}</td>
+      </tr>`).join("");
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>KM Report — ${title}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: Arial, sans-serif; font-size: 11px; color: #1a1a1a; padding: 24px; }
+  .header { border-bottom: 3px solid #0D0D0D; padding-bottom: 12px; margin-bottom: 20px; }
+  .header h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+  .header .meta { font-size: 11px; color: #555; }
+  .stats { display: flex; gap: 16px; margin-bottom: 20px; }
+  .stat { background: #f5f5f5; border-left: 4px solid #0D0D0D; padding: 10px 16px; flex: 1; }
+  .stat .val { font-size: 20px; font-weight: 700; }
+  .stat .lbl { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 0.08em; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+  th { background: #0D0D0D; color: #fff; padding: 8px 10px; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+  td { padding: 7px 10px; border-bottom: 1px solid #eee; }
+  tr:last-child td { border-bottom: none; }
+  tr:nth-child(even) td { background: #fafafa; }
+  .section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; color: #555; }
+  .total-row { background: #0D0D0D !important; }
+  .total-row td { color: #C8F04A !important; font-weight: 700; font-size: 13px; border: none; padding: 10px; }
+  .footer { margin-top: 24px; font-size: 10px; color: #aaa; border-top: 1px solid #eee; padding-top: 10px; }
+  @media print { body { padding: 0; } }
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>KM Reimbursement Report</h1>
+    <div class="meta">
+      Period: <strong>${title}</strong> &nbsp;|&nbsp;
+      Vehicle: <strong>${data.vehicle}</strong> &nbsp;|&nbsp;
+      Generated: <strong>${new Date().toLocaleDateString("en-ZA")}</strong>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="val">${reportStats.totalKm.toLocaleString()} km</div>
+      <div class="lbl">Total Distance</div>
+    </div>
+    <div class="stat">
+      <div class="val">${filteredTrips.length}</div>
+      <div class="lbl">Total Trips</div>
+    </div>
+    <div class="stat">
+      <div class="val">${formatZAR(reportStats.totalReimb)}</div>
+      <div class="lbl">Total Reimbursement</div>
+    </div>
+  </div>
+
+  <div class="section-title">Trip Log</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th><th style="text-align:right">Open KM</th><th style="text-align:right">Close KM</th><th style="text-align:right">Distance</th><th>Description</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>
+
+  <div class="section-title">Rate Breakdown</div>
+  <table>
+    <thead>
+      <tr><th>Month</th><th style="text-align:right">KM</th><th style="text-align:right">Rate</th><th style="text-align:right">Reimbursement</th></tr>
+    </thead>
+    <tbody>
+      ${breakdown}
+      <tr class="total-row">
+        <td colspan="3">TOTAL REIMBURSEMENT</td>
+        <td style="text-align:right">${formatZAR(reportStats.totalReimb)}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="footer">KM Tracker — Madz Enterprizes &nbsp;|&nbsp; ${new Date().toLocaleString("en-ZA")}</div>
+</body>
+</html>`;
+
+    const win = window.open("", "_blank");
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    setTimeout(() => { win.print(); }, 500);
+    showToast("PDF ready — save as PDF in print dialog ✓");
+  }
+
+  // ── EMAIL ──
+  function sendEmail() {
     if (!data.recipients.length) return showToast("Add at least one recipient", "error");
     if (!filteredTrips.length) return showToast("No trips in selected period", "error");
-    setEmailSending(true);
-    const subject = `KM Report — ${reportType === "monthly" ? monthLabel(reportMonth) : reportType === "weekly" ? `Week ${reportWeek}` : "All Trips"}`;
-    const body = buildReportText();
-    const mailto = `mailto:${data.recipients.join(",")}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-    window.location.href = mailto;
-    setTimeout(() => {
-      setEmailSending(false);
-      showToast("Email client opened ✓");
-    }, 1000);
+    const title = getReportTitle();
+    const subject = `KM Reimbursement Report — ${title}`;
+    const body = `Hi,\n\nPlease find below the KM reimbursement report for ${title}.\n\nVehicle: ${data.vehicle}\nTotal KM: ${formatKm(reportStats.totalKm)}\nTotal Reimbursement: ${formatZAR(reportStats.totalReimb)}\n\nTrip Summary:\n${filteredTrips.map(t => `${t.date} | ${t.openKm}→${t.closeKm} (${t.km}km) | ${t.description}`).join("\n")}\n\nNote: Download the Excel or PDF report for the full formatted version.\n\nRegards`;
+    window.location.href = `mailto:${data.recipients.join(",")}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    showToast("Email client opened ✓");
   }
 
   const months = useMemo(() => {
@@ -211,8 +386,14 @@ export default function KmTracker() {
         .input { width: 100%; background: #0D0D0D; border: 1px solid #2A2A2A; border-radius: 8px; padding: 12px; color: #E8E4DC; font-size: 14px; outline: none; transition: border-color 0.2s; }
         .input:focus { border-color: #C8F04A; }
         .btn { border: none; border-radius: 8px; padding: 13px 20px; font-family: inherit; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s; letter-spacing: 0.05em; }
-        .btn-primary { background: #C8F04A; color: #0D0D0D; width: 100%; font-size: 14px; font-weight: 500; }
+        .btn-primary { background: #C8F04A; color: #0D0D0D; width: 100%; font-size: 14px; font-weight: 500; margin-bottom: 10px; }
         .btn-primary:active { transform: scale(0.98); background: #b8e030; }
+        .btn-excel { background: #1a6b3a; color: #fff; width: 100%; font-size: 13px; margin-bottom: 10px; }
+        .btn-excel:active { transform: scale(0.98); background: #155a30; }
+        .btn-pdf { background: #6b1a1a; color: #fff; width: 100%; font-size: 13px; margin-bottom: 10px; }
+        .btn-pdf:active { transform: scale(0.98); background: #5a1515; }
+        .btn-email { background: #1a3a6b; color: #fff; width: 100%; font-size: 13px; margin-bottom: 10px; }
+        .btn-email:active { transform: scale(0.98); }
         .btn-ghost { background: transparent; color: #666; border: 1px solid #2A2A2A; font-size: 12px; padding: 8px 12px; }
         .btn-ghost:hover { border-color: #444; color: #aaa; }
         .btn-danger { background: transparent; color: #ff4444; border: 1px solid #2a1a1a; font-size: 11px; padding: 6px 10px; border-radius: 6px; cursor: pointer; font-family: inherit; }
@@ -222,7 +403,6 @@ export default function KmTracker() {
         .stat-box { background: #0D0D0D; border: 1px solid #1e1e1e; border-radius: 10px; padding: 16px; flex: 1; }
         .stat-val { font-family: 'Syne', sans-serif; font-size: 22px; font-weight: 800; color: #C8F04A; line-height: 1; margin-bottom: 4px; }
         .stat-lbl { font-size: 10px; color: #555; letter-spacing: 0.1em; text-transform: uppercase; }
-        .section-title { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 800; margin-bottom: 16px; }
         .rate-chip { display: flex; justify-content: space-between; align-items: center; background: #111; border: 1px solid #222; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; font-size: 13px; }
         .email-chip { display: flex; justify-content: space-between; align-items: center; background: #111; border: 1px solid #222; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
         .toast { position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%); background: #C8F04A; color: #0D0D0D; padding: 10px 20px; border-radius: 30px; font-size: 13px; font-weight: 500; z-index: 999; white-space: nowrap; animation: fadeIn 0.2s; }
@@ -246,9 +426,10 @@ export default function KmTracker() {
         .warn { background: #1a120a; border: 1px solid #3a2010; border-radius: 8px; padding: 10px 14px; font-size: 12px; color: #f0930a; margin-bottom: 12px; }
         .divider { border: none; border-top: 1px solid #1e1e1e; margin: 16px 0; }
         .flex-gap { display: flex; gap: 10px; }
+        .export-section { background: #111; border: 1px solid #1e1e1e; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+        .export-label { font-size: 10px; color: #555; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 12px; }
       `}</style>
 
-      {/* HEADER */}
       <div className="header">
         <div className="header-top">
           <div>
@@ -261,7 +442,7 @@ export default function KmTracker() {
             <div className="page-sub" style={{ marginTop: 4 }}>
               {tab === "log" && data.vehicle}
               {tab === "trips" && `${data.trips.length} trips total`}
-              {tab === "report" && "reimbursement calculator"}
+              {tab === "report" && "export & send"}
               {tab === "settings" && "configure your tracker"}
             </div>
           </div>
@@ -274,10 +455,8 @@ export default function KmTracker() {
         </div>
       </div>
 
-      {/* CONTENT */}
       <div className="content">
 
-        {/* LOG TRIP TAB */}
         {tab === "log" && (
           <>
             <div className="card">
@@ -307,22 +486,16 @@ export default function KmTracker() {
               <input className="input" type="text" placeholder="e.g. Client visit — Sandton" value={tripForm.description} onChange={e => setTripForm(f => ({ ...f, description: e.target.value }))} />
             </div>
             <button className="btn btn-primary" onClick={addTrip}>Log Trip</button>
-
-            {/* Quick stats */}
             {data.trips.length > 0 && (
               <div style={{ marginTop: 24 }}>
                 <div style={{ fontSize: 10, color: "#444", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 12 }}>This Month</div>
                 <div className="flex-gap">
                   <div className="stat-box">
-                    <div className="stat-val">
-                      {data.trips.filter(t => getMonthYear(t.date) === getMonthYear(new Date().toISOString())).reduce((s, t) => s + t.km, 0).toLocaleString()}
-                    </div>
+                    <div className="stat-val">{data.trips.filter(t => getMonthYear(t.date) === getMonthYear(new Date().toISOString())).reduce((s, t) => s + t.km, 0).toLocaleString()}</div>
                     <div className="stat-lbl">km logged</div>
                   </div>
                   <div className="stat-box">
-                    <div className="stat-val">
-                      {data.trips.filter(t => getMonthYear(t.date) === getMonthYear(new Date().toISOString())).length}
-                    </div>
+                    <div className="stat-val">{data.trips.filter(t => getMonthYear(t.date) === getMonthYear(new Date().toISOString())).length}</div>
                     <div className="stat-lbl">trips</div>
                   </div>
                 </div>
@@ -331,7 +504,6 @@ export default function KmTracker() {
           </>
         )}
 
-        {/* TRIPS TAB */}
         {tab === "trips" && (
           <>
             {data.trips.length === 0 ? (
@@ -361,7 +533,6 @@ export default function KmTracker() {
           </>
         )}
 
-        {/* REPORT TAB */}
         {tab === "report" && (
           <>
             <div className="card">
@@ -395,7 +566,6 @@ export default function KmTracker() {
               <div className="warn">⚠ No rate set for: {reportStats.missingRates.join(", ")} — go to Settings → Monthly Rates</div>
             )}
 
-            {/* Summary stats */}
             <div className="flex-gap" style={{ marginBottom: 16 }}>
               <div className="stat-box">
                 <div className="stat-val">{reportStats.totalKm.toLocaleString()}</div>
@@ -407,7 +577,6 @@ export default function KmTracker() {
               </div>
             </div>
 
-            {/* Rate breakdown */}
             {Object.keys(reportStats.byMonth).length > 0 && (
               <div className="card">
                 <div style={{ fontSize: 11, color: "#555", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 12 }}>Rate Breakdown</div>
@@ -421,17 +590,12 @@ export default function KmTracker() {
               </div>
             )}
 
-            {/* Trip table */}
             {filteredTrips.length > 0 && (
               <div className="card" style={{ overflowX: "auto" }}>
                 <table className="report-table">
                   <thead>
                     <tr>
-                      <th>Date</th>
-                      <th>Open</th>
-                      <th>Close</th>
-                      <th>KM</th>
-                      <th>Description</th>
+                      <th>Date</th><th>Open</th><th>Close</th><th>KM</th><th>Description</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -453,20 +617,31 @@ export default function KmTracker() {
               <div style={{ textAlign: "center", padding: "40px 0", color: "#333", fontSize: 13 }}>No trips in selected period</div>
             )}
 
-            <button className="btn btn-primary" onClick={sendReport} disabled={emailSending} style={{ opacity: emailSending ? 0.7 : 1 }}>
-              {emailSending ? "Opening email..." : `📧 Email Report (${data.recipients.length} recipient${data.recipients.length !== 1 ? "s" : ""})`}
-            </button>
-            {data.recipients.length === 0 && (
-              <div style={{ textAlign: "center", fontSize: 11, color: "#555", marginTop: 8 }}>Add recipients in Settings first</div>
-            )}
+            {/* EXPORT BUTTONS */}
+            <div className="export-section">
+              <div className="export-label">Download Report</div>
+              <button className="btn btn-excel" onClick={downloadExcel}>📥 Download Excel (.xlsx)</button>
+              <button className="btn btn-pdf" onClick={downloadPDF}>📄 Download PDF</button>
+            </div>
+
+            <div className="export-section">
+              <div className="export-label">Send via Email</div>
+              <button className="btn btn-email" onClick={sendEmail}>
+                📧 Email Summary ({data.recipients.length} recipient{data.recipients.length !== 1 ? "s" : ""})
+              </button>
+              {data.recipients.length === 0 && (
+                <div style={{ textAlign: "center", fontSize: 11, color: "#555", marginTop: 4 }}>Add recipients in Settings first</div>
+              )}
+              <div style={{ fontSize: 11, color: "#444", textAlign: "center", marginTop: 8 }}>
+                Tip: Download Excel/PDF first, then attach manually to the email
+              </div>
+            </div>
           </>
         )}
 
-        {/* SETTINGS TAB */}
         {tab === "settings" && (
           <>
-            {/* Vehicle */}
-            <div className="section-title" style={{ fontSize: 14, marginBottom: 12 }}>Vehicle</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 12 }}>Vehicle</div>
             <div className="card">
               <label className="label">Vehicle Name / Reg</label>
               <div className="flex-gap">
@@ -477,13 +652,13 @@ export default function KmTracker() {
             </div>
 
             <hr className="divider" />
-            <div className="section-title" style={{ fontSize: 14, marginBottom: 12 }}>Monthly Reimbursement Rates</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 12 }}>Monthly Reimbursement Rates</div>
             <div className="card">
               <label className="label">Month</label>
               <input className="input" type="month" value={rateForm.month} onChange={e => setRateForm(f => ({ ...f, month: e.target.value }))} style={{ marginBottom: 12 }} />
               <label className="label">Rate (R per km)</label>
               <div className="flex-gap">
-                <input className="input" style={{ flex: 1 }} type="number" step="0.01" inputMode="decimal" placeholder="e.g. 4.64" value={rateForm.rate} onChange={e => setRateForm(f => ({ ...f, rate: e.target.value }))} />
+                <input className="input" style={{ flex: 1 }} type="number" step="0.01" inputMode="decimal" placeholder="e.g. 4.84" value={rateForm.rate} onChange={e => setRateForm(f => ({ ...f, rate: e.target.value }))} />
                 <button className="btn btn-ghost" onClick={saveRate}>Save</button>
               </div>
             </div>
@@ -499,7 +674,7 @@ export default function KmTracker() {
             )}
 
             <hr className="divider" />
-            <div className="section-title" style={{ fontSize: 14, marginBottom: 12 }}>Report Recipients</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 12 }}>Report Recipients</div>
             <div className="card">
               <label className="label">Email Address</label>
               <div className="flex-gap">
@@ -526,7 +701,6 @@ export default function KmTracker() {
         )}
       </div>
 
-      {/* BOTTOM NAV */}
       <nav className="nav">
         {tabs.map(t => (
           <button key={t.id} className={`nav-btn ${tab === t.id ? "active" : ""}`} onClick={() => setTab(t.id)}>
@@ -536,7 +710,6 @@ export default function KmTracker() {
         ))}
       </nav>
 
-      {/* TOAST */}
       {toast && <div className={`toast ${toast.type === "error" ? "error" : ""}`}>{toast.msg}</div>}
     </div>
   );
